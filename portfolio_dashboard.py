@@ -16,10 +16,10 @@ def get_fresh_recs():
     query = "best undervalued ETFs and mutual funds for long-term retirement 2025, medium-high risk, Warren Buffett style, no China exposure"
     results = []
     try:
-        for url in search(query, num_results=10, pause=2.0):
+        for url in search(query, num_results=10):  # Removed pause parameter
             results.append(url)
     except Exception as e:
-        st.warning(f"Web search failed: {str(e)}. Using fallback tickers.")
+        st.warning(f"Web search failed: {str(e)}. Using fallback tickers (VOO, VUG, SCHD).")
         return ['VOO', 'VUG', 'SCHD']
     tickers = []
     common_tickers = ['voo', 'vug', 'schd', 'vig', 'moat', 'ijr', 'qqq', 'schg', 'sphq', 'vtiax', 'fbgrx', 'fdgrx', 'vdigx', 'prdgx', 'ihf', 'tmed', 'scha', 'spmd', 'ivv', 'vti', 'iwy', 'mgk', 'prnhx', 'vfinx']
@@ -84,33 +84,36 @@ if uploaded_files:
             if not all(col in df.columns for col in required_columns):
                 missing = [col for col in required_columns if col not in df.columns]
                 raise ValueError(f"CSV missing required columns: {', '.join(missing)}")
+            # Filter out invalid symbols early (e.g., ** or NaN)
+            df = df[df['Symbol'].notna() & ~df['Symbol'].str.contains('\*\*', na=False)]
+            if df.empty:
+                raise ValueError("No valid rows after filtering invalid symbols (e.g., containing '**' or NaN)")
             # Clean and validate numeric columns
             for col in ['Quantity', 'Last Price', 'Cost Basis Total']:
                 if col in df.columns:
                     df[col] = df[col].replace(r'[\$,]', '', regex=True)  # Remove $ and commas
                     df[col] = pd.to_numeric(df[col], errors='coerce')
-                    # Check for NaN or non-numeric values
+                    # Log invalid rows
                     invalid_rows = df[df[col].isna()]
                     if not invalid_rows.empty:
                         error_msg = f"Non-numeric or missing values in {col}:\n"
                         for idx, row in invalid_rows.iterrows():
                             error_msg += f"Row {idx + 2}: Symbol={row['Symbol']}, {col}={row[col]}\n"
-                        st.error(error_msg)
+                        st.warning(error_msg)
                         # Filter out invalid rows
                         df = df[df[col].notna()]
                         if df.empty:
-                            raise ValueError(f"All rows in {col} are invalid")
+                            raise ValueError(f"All rows in {col} are invalid after filtering")
             dfs.append(df)
         if not dfs:
             raise ValueError("No valid data after cleaning")
         portfolio = pd.concat(dfs, ignore_index=True)
-        portfolio = portfolio[portfolio['Symbol'].notna() & ~portfolio['Symbol'].str.contains('\*\*', na=False)]
         if portfolio.empty:
             raise ValueError("No valid rows in CSV after filtering")
         st.session_state.portfolio = portfolio
         st.success("CSV uploaded and persisted! Refresh to keep using.")
     except Exception as e:
-        st.error(f"Upload error: {str(e)}. Ensure CSV has Symbol, Quantity, Last Price, Cost Basis Total with valid numeric values.")
+        st.error(f"Upload error: {str(e)}. Ensure CSV has Symbol, Quantity, Last Price, Cost Basis Total with valid numeric values. Remove cash positions (e.g., FCASH, SPAXX, CORE) or fix NaN symbols.")
 
 # Use persisted portfolio
 if st.session_state.portfolio is not None:
@@ -345,7 +348,7 @@ if st.session_state.portfolio is not None:
             st.download_button("Download", report, "portfolio_report.csv", "text/csv")
 
     except Exception as e:
-        st.error(f"Error processing: {str(e)}. Ensure CSV has Symbol, Quantity, Last Price, Cost Basis Total with valid numeric values.")
+        st.error(f"Error processing: {str(e)}. Ensure CSV has Symbol, Quantity, Last Price, Cost Basis Total with valid numeric values. Remove cash positions (e.g., FCASH, SPAXX, CORE) or fix NaN symbols.")
 
 # Alerts
 st.subheader("Set Up Alerts")
@@ -367,7 +370,7 @@ if st.button("Test Alert"):
                 pass
         if alerts:
             msg = MIMEText("\n".join(alerts))
-            msg['Subject'] = f"Portfolio Alert - {datetime.now().strftime('%Y-%m-%d')}"
+            msg['Subject'] = f"Portfolio Alert - {datetime.now().strftime('%Y-%-m-%d')}"
             msg['From'] = email
             msg['To'] = receiver
             with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:

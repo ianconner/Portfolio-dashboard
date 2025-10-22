@@ -179,7 +179,15 @@ if st.session_state.portfolio is not None:
                 ticker_data = yf.Ticker(ticker)
                 info = ticker_data.info
                 csv_price = portfolio[portfolio['Symbol'] == ticker]['Last Price'].iloc[0] if ticker in portfolio['Symbol'].values else np.nan
-                current_prices[ticker] = info.get('regularMarketPrice', csv_price)
+                price = info.get('regularMarketPrice', np.nan)
+                if pd.isna(price) and not pd.isna(csv_price):
+                    price = csv_price
+                    st.info(f"Using CSV Last Price for {ticker}: {csv_price}")
+                if pd.isna(price):
+                    st.warning(f"No valid price for {ticker} from yfinance or CSV")
+                    failed_tickers.append(ticker)
+                    continue
+                current_prices[ticker] = price
                 sectors[ticker] = info.get('sector', info.get('category', 'Unknown'))
 
                 hist = ticker_data.history(period="5y")['Close']
@@ -200,16 +208,22 @@ if st.session_state.portfolio is not None:
                 }
             except Exception as e:
                 if ticker in portfolio['Symbol'].values:
-                    current_prices[ticker] = portfolio[portfolio['Symbol'] == ticker]['Last Price'].iloc[0]
-                    fundamentals[ticker] = {
-                        'pe': np.nan,
-                        'pb': np.nan,
-                        'beta': np.nan,
-                        'roe': np.nan,
-                        'debt_to_equity': np.nan,
-                        '5y_return': portfolio[portfolio['Symbol'] == ticker]['Total Gain/Loss Percent'].iloc[0] / 5 if 'Total Gain/Loss Percent' in portfolio.columns else np.nan,
-                        'expense_ratio': np.nan
-                    }
+                    csv_price = portfolio[portfolio['Symbol'] == ticker]['Last Price'].iloc[0]
+                    if not pd.isna(csv_price):
+                        current_prices[ticker] = csv_price
+                        st.info(f"Using CSV Last Price for {ticker}: {csv_price}")
+                        fundamentals[ticker] = {
+                            'pe': np.nan,
+                            'pb': np.nan,
+                            'beta': np.nan,
+                            'roe': np.nan,
+                            'debt_to_equity': np.nan,
+                            '5y_return': portfolio[portfolio['Symbol'] == ticker]['Total Gain/Loss Percent'].iloc[0] / 5 if 'Total Gain/Loss Percent' in portfolio.columns else np.nan,
+                            'expense_ratio': np.nan
+                        }
+                    else:
+                        st.warning(f"No valid CSV Last Price for {ticker}")
+                        failed_tickers.append(ticker)
                 else:
                     current_prices[ticker] = np.nan
                     fundamentals[ticker] = {
@@ -221,7 +235,7 @@ if st.session_state.portfolio is not None:
                         '5y_return': np.nan,
                         'expense_ratio': np.nan
                     }
-                failed_tickers.append(ticker)
+                    failed_tickers.append(ticker)
                 st.warning(f"yfinance failed for {ticker}: {str(e)}")
 
         if failed_tickers:
@@ -281,7 +295,7 @@ if st.session_state.portfolio is not None:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             return df
 
-        # Create recommendation DataFrames before display sections
+        # Create recommendation DataFrames
         buys_df = get_rec_df(POTENTIAL_BUYS, is_buy=True)
         sells_df = get_rec_df(POTENTIAL_SELLS, is_buy=False)
 

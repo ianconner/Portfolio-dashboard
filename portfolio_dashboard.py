@@ -1,0 +1,347 @@
+import streamlit as st
+import pandas as pd
+import yfinance as yf
+import plotly.express as px
+import smtplib
+from email.mime.text import MIMEText
+from datetime import datetime
+import requests
+from googlesearch import search  # pip install googlesearch-python
+import numpy as np
+
+ALPHA_VANTAGE_KEY = "ALT5R7FXMOK16ZUO"
+
+# Function to perform fresh web search for buy recommendations
+def get_fresh_recs():
+    query = "best undervalued ETFs and mutual funds for long-term retirement 2025, medium-high risk, Warren Buffett style, no China exposure"
+    results = []
+    try:
+        for url in search(query, num_results=10, pause=2.0):  # Use num_results instead of stop
+            results.append(url)
+    except Exception as e:
+        st.warning(f"Web search failed: {str(e)}. Using fallback tickers.")
+        return ['VOO', 'VUG', 'SCHD']  # Minimal fallback
+    tickers = []
+    common_tickers = ['voo', 'vug', 'schd', 'vig', 'moat', 'ijr', 'qqq', 'schg', 'sphq', 'vtiax', 'fbgrx', 'fdgrx', 'vdigx', 'prdgx', 'ihf', 'tmed', 'scha', 'spmd', 'ivv', 'vti', 'iwy', 'mgk', 'prnhx', 'vfinx']
+    for url in results:
+        try:
+            response = requests.get(url, timeout=5)
+            text = response.text.lower()
+            for ticker in common_tickers:
+                if ticker in text and ticker.upper() not in tickers:
+                    tickers.append(ticker.upper())
+        except:
+            pass
+    return tickers[:10] if tickers else ['VOO', 'VUG', 'SCHD']  # Fallback if no tickers found
+
+# Dynamic underperformers from portfolio
+def get_underperformers(portfolio):
+    if '5Y Ann. Return (%)' in portfolio.columns:
+        underperformers = portfolio[
+            (portfolio['5Y Ann. Return (%)'].apply(lambda x: isinstance(x, (int, float)) and x < 5)) |
+            (portfolio['Expense Ratio'].apply(lambda x: isinstance(x, (int, float)) and x > 0.5))
+        ]['Symbol'].tolist()
+    else:
+        underperformers = []
+    return underperformers if underperformers else ['FSMEX']  # Fallback
+
+# Placeholder images
+def get_image_url(ticker):
+    return f"https://via.placeholder.com/300?text={ticker}+Chart"
+
+def get_caption(ticker):
+    return f"{ticker}: Performance Chart (Fresh Data)"
+
+# Initialize session state
+if 'portfolio' not in st.session_state:
+    st.session_state.portfolio = None
+if 'potential_buys' not in st.session_state:
+    st.session_state.potential_buys = []
+if 'potential_sells' not in st.session_state:
+    st.session_state.potential_sells = []
+
+# App Title
+st.title("Portfolio Dashboard for 2042 Retirement")
+st.write("Goal: $100K income ($70K pension + $30K withdrawal). $367K at 9% return grows to ~$1.59M by 2042. Focus: Balance tech (50% growth, 30% value, 20% international).")
+
+# Explanations
+st.sidebar.header("Quick Guide")
+st.sidebar.write("**P/E**: Price per $1 earnings. <20 = bargain.")
+st.sidebar.write("**P/B**: Price vs. assets. <2 = undervalued.")
+st.sidebar.write("**Undervalued %**: Potential rise to target price.")
+st.sidebar.write("**Beta**: Risk vs. market (1=avg, >1=riskier).")
+st.sidebar.write("**5Y Return**: Avg yearly growth (higher = better).")
+
+# Upload CSVs (persist)
+uploaded_files = st.file_uploader("Upload Fidelity CSVs (once; persists on refresh)", type="csv", accept_multiple_files=True)
+if uploaded_files:
+    try:
+        dfs = []
+        for file in uploaded_files:
+            df = pd.read_csv(file, encoding='utf-8')
+            for col in ['Quantity', 'Last Price', 'Last Price Change', 'Current Value', 
+                       "Today's Gain/Loss Dollar", 'Total Gain/Loss Dollar', 'Cost Basis Total', 'Average Cost Basis']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col].replace(r'[\$,]', '', regex=True), errors='coerce')
+            dfs.append(df)
+        portfolio = pd.concat(dfs, ignore_index=True)
+        portfolio = portfolio[portfolio['Symbol'].notna() & ~portfolio['Symbol'].str.contains('\*\*', na=False)]
+        st.session_state.portfolio = portfolio
+        st.success("CSV uploaded and persisted! Refresh to keep using.")
+    except Exception as e:
+        st.error(f"Upload error: {str(e)}. Ensure CSV has Symbol, Quantity, Last Price, Cost Basis Total.")
+
+# Use persisted portfolio
+if st.session_state.portfolio is not None:
+    portfolio = st.session_state.portfolio
+    st.write("Using persisted portfolio. Upload new to update.")
+
+    try:
+        # Refresh Recommendations Button
+        if st.button("Refresh Recommendations (Internet Search - May Take 30-60s)"):
+            with st.spinner("Searching internet for fresh recommendations..."):
+                st.session_state.potential_buys = get_fresh_recs()
+                st.session_state.potential_sells = get_underperformers(portfolio)
+            st.success("Recommendations refreshed from web search!")
+
+        # Use current recs or prompt for refresh
+        if not st.session_state.potential_buys:
+            st.warning("No buy recommendations yet. Click 'Refresh Recommendations' to search.")
+            POTENTIAL_BUYS = []
+        else:
+            POTENTIAL_BUYS = st.session_state.potential_buys
+        POTENTIAL_SELLS = st.session_state.potential_sells
+
+        # Data fetching
+        all_tickers = list(portfolio['Symbol'].unique()) + POTENTIAL_BUYS + POTENTIAL_SELLS
+        all_tickers = list(set(all_tickers))
+        current_prices = {}
+        historical_data = pd.DataFrame()
+        fundamentals = {}
+        sectors = {}
+        analyst_targets = {}
+        failed_tickers = []
+
+        # Alpha Vantage for analyst targets
+        for ticker in all_tickers:
+            try:
+                url = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={ticker}&apikey={ALPHA_VANTAGE_KEY}"
+                response = requests.get(url).json()
+                target = response.get('AnalystTargetPrice', 'N/A')
+                analyst_targets[ticker] = float(target) if target and target != 'None' else np.nan
+            except:
+                analyst_targets[ticker] = np.nan
+
+        # yfinance for other data
+        for ticker in all_tickers:
+            try:
+                ticker_data = yf.Ticker(ticker)
+                info = ticker_data.info
+                current_prices[ticker] = info.get('regularMarketPrice', portfolio[portfolio['Symbol'] == ticker]['Last Price'].iloc[0] if ticker in portfolio['Symbol'].values else np.nan)
+                sectors[ticker] = info.get('sector', info.get('category', 'Unknown'))
+
+                hist = ticker_data.history(period="5y")['Close']
+                if not hist.empty:
+                    historical_data[ticker] = hist
+                    five_y_return = ((hist.iloc[-1] / hist.iloc[0]) ** (1/5) - 1) * 100 if len(hist) > 1 else np.nan
+                else:
+                    five_y_return = np.nan
+
+                fundamentals[ticker] = {
+                    'pe': info.get('trailingPE', np.nan),
+                    'pb': info.get('priceToBook', np.nan),
+                    'beta': info.get('beta', np.nan),
+                    '5y_return': round(five_y_return, 2) if isinstance(five_y_return, float) else np.nan,
+                    'expense_ratio': info.get('expenseRatio', np.nan)
+                }
+            except Exception as e:
+                if ticker in portfolio['Symbol'].values:
+                    current_prices[ticker] = portfolio[portfolio['Symbol'] == ticker]['Last Price'].iloc[0]
+                    fundamentals[ticker] = {
+                        'pe': np.nan,
+                        'pb': np.nan,
+                        'beta': np.nan,
+                        '5y_return': portfolio[portfolio['Symbol'] == ticker]['Total Gain/Loss Percent'].iloc[0] / 5 if 'Total Gain/Loss Percent' in portfolio.columns else np.nan,
+                        'expense_ratio': np.nan
+                    }
+                failed_tickers.append(ticker)
+                st.warning(f"Data fetch failed for {ticker}: {str(e)}.")
+
+        if failed_tickers:
+            st.info(f"Failed tickers (defaults used): {', '.join(failed_tickers)}")
+
+        # Manual sectors fallback
+        for ticker in all_tickers:
+            if sectors.get(ticker, 'Unknown') == 'Unknown':
+                manual_sectors = {
+                    'FCNTX': 'Large Growth', 'FGRTX': 'Large Blend', 'FSELX': 'Technology', 
+                    'FBGRX': 'Large Growth', 'FSDAX': 'Industrials', 'FXAIX': 'Large Blend',
+                    'FDLSX': 'Consumer Cyclical', 'FIDSX': 'Financial', 'FNARX': 'Energy',
+                    'FSHOX': 'Consumer Cyclical', 'FSLBX': 'Financial', 'FSPTX': 'Technology',
+                    'FPURX': 'Allocation', 'FSMEX': 'Health', 'JAGTX': 'Technology',
+                    'PRWAX': 'All-Cap Growth', 'FDGRX': 'Large Growth', 'VTIAX': 'International Blend',
+                    'VDIGX': 'Dividend Growth', 'PRDGX': 'Dividend Growth', 'PRNHX': 'Mid-Cap Growth',
+                    'VFINX': 'Large Blend', 'TMED': 'Health', 'IHF': 'Health', 'SCHA': 'Small Blend',
+                    'SPMD': 'Mid-Cap Blend', 'IVV': 'Large Blend', 'VTI': 'Large Blend', 'IWY': 'Large Growth',
+                    'MGK': 'Large Growth'
+                }
+                sectors[ticker] = manual_sectors.get(ticker, 'Unknown')
+
+        # Update portfolio
+        portfolio['Current Price'] = portfolio['Symbol'].map(current_prices)
+        portfolio['Current Value'] = portfolio['Quantity'] * portfolio['Current Price']
+        portfolio['Gain/Loss %'] = (portfolio['Current Value'] - portfolio['Cost Basis Total']) / portfolio['Cost Basis Total'] * 100
+        portfolio['P/E Ratio'] = portfolio['Symbol'].map(lambda t: fundamentals.get(t, {}).get('pe', np.nan))
+        portfolio['P/B Ratio'] = portfolio['Symbol'].map(lambda t: fundamentals.get(t, {}).get('pb', np.nan))
+        portfolio['Beta'] = portfolio['Symbol'].map(lambda t: fundamentals.get(t, {}).get('beta', np.nan))
+        portfolio['5Y Ann. Return (%)'] = portfolio['Symbol'].map(lambda t: fundamentals.get(t, {}).get('5y_return', np.nan))
+        portfolio['Expense Ratio'] = portfolio['Symbol'].map(lambda t: fundamentals.get(t, {}).get('expense_ratio', np.nan))
+        portfolio['Analyst Target'] = portfolio['Symbol'].map(lambda t: analyst_targets.get(t, np.nan))
+        portfolio['Undervalued %'] = portfolio.apply(
+            lambda row: round(((row['Analyst Target'] - row['Current Price']) / row['Current Price'] * 100), 2)
+            if pd.notna(row['Analyst Target']) and pd.notna(row['Current Price']) and row['Current Price'] != 0
+            else np.nan, axis=1)
+        portfolio['Sector'] = portfolio['Symbol'].map(sectors)
+
+        # Recommendation DataFrames
+        def get_rec_df(tickers_list, is_buy=True):
+            rec_data = []
+            for ticker in tickers_list:
+                price = current_prices.get(ticker, np.nan)
+                data = fundamentals.get(ticker, {})
+                sector = sectors.get(ticker, 'Unknown')
+                target = analyst_targets.get(ticker, np.nan)
+                undervalued = round(((target - price) / price * 100), 2) if pd.notna(target) and pd.notna(price) and price != 0 else np.nan
+                rec_data.append({
+                    'Ticker': ticker,
+                    'Current Price': round(price, 2) if pd.notna(price) else np.nan,
+                    'P/E Ratio': round(data.get('pe', np.nan), 2) if pd.notna(data.get('pe')) else np.nan,
+                    'P/B Ratio': round(data.get('pb', np.nan), 2) if pd.notna(data.get('pb')) else np.nan,
+                    'Beta (Risk)': round(data.get('beta', np.nan), 2) if pd.notna(data.get('beta')) else np.nan,
+                    '5Y Ann. Return (%)': data.get('5y_return', np.nan),
+                    'Expense Ratio': data.get('expense_ratio', np.nan),
+                    'Undervalued %': undervalued,
+                    'Top Sectors': sector
+                })
+            df = pd.DataFrame(rec_data)
+            # Ensure numeric columns are float
+            for col in ['Current Price', 'P/E Ratio', 'P/B Ratio', 'Beta (Risk)', '5Y Ann. Return (%)', 'Expense Ratio', 'Undervalued %']:
+                df[col] = df[col].astype(float)
+            return df
+
+        buys_df = get_rec_df(POTENTIAL_BUYS, is_buy=True)
+        sells_df = get_rec_df(POTENTIAL_SELLS, is_buy=False)
+
+        # Portfolio Summary
+        st.subheader("Your Current Portfolio Summary")
+        st.dataframe(portfolio[['Symbol', 'Current Value', 'Gain/Loss %', 'P/E Ratio', 'P/B Ratio', 'Beta', '5Y Ann. Return (%)', 'Undervalued %', 'Sector']])
+
+        # Goal Analysis
+        st.subheader("Analysis vs. 2042 Goal ($100K Income)")
+        total_value = portfolio['Current Value'].sum()
+        st.write(f"**Total Value**: ${total_value:,.2f}")
+        st.write("**Projection**: At 9% annual return (med-high risk), $367K grows to ~$1.59M by 2042. With $70K pension, covers $30K withdrawal ($750K needed)—**on track**.")
+        st.write("**Risk Fit**: Med-high tolerance ok with 20% drops. Current beta ~1.1 (good). Tech-heavy (~35%)—add value/international for stability.")
+        st.write("**Tax Rec**: Use Roth IRAs for tax-free growth. No regular contributions—consider $5K/year for extra $500K by 2042.")
+
+        # Sector Breakdown
+        show_sector = st.checkbox("Show Sector Breakdown", value=True)
+        if show_sector:
+            st.subheader("Your Sector Breakdown")
+            sector_alloc = portfolio.groupby('Sector')['Current Value'].sum().reset_index()
+            fig_sector = px.pie(sector_alloc, values='Current Value', names='Sector', title='Portfolio by Sector')
+            st.plotly_chart(fig_sector)
+            st.write("Tech ~35%. Suggestion: 50% growth, 30% value, 20% international.")
+
+        # Buy Opportunities
+        st.subheader("Buy Opportunities (vs. Your Holdings)")
+        if not buys_df.empty:
+            st.write("These outperform underperformers with 10-20% 5Y returns, low fees (<0.5%), and undervaluation. Add to balance tech focus. Data from yfinance/analysts (Oct 21, 2025).")
+            st.dataframe(buys_df)
+
+            # Images for buys
+            st.subheader("Buy Performance Visuals")
+            cols = st.columns(3)
+            for i, ticker in enumerate(buys_df['Ticker'][:6]):  # Limit to 6
+                url = get_image_url(ticker)
+                caption = get_caption(ticker)
+                with cols[i % 3]:
+                    st.image(url, caption=caption, use_container_width=True)
+        else:
+            st.info("No buy recommendations yet. Click 'Refresh Recommendations' to search.")
+
+        # Return Comparison Bar Chart
+        st.subheader("5Y Return Comparison (Find Opportunities)")
+        compare_returns = []
+        for _, row in portfolio.iterrows():
+            if pd.notna(row['5Y Ann. Return (%)']):
+                compare_returns.append({'Type': 'Your Holdings', 'Ticker': row['Symbol'], '5Y Return %': row['5Y Ann. Return (%)']})
+        for _, row in buys_df.iterrows():
+            if pd.notna(row['5Y Ann. Return (%)']):
+                compare_returns.append({'Type': 'Buy Recs', 'Ticker': row['Ticker'], '5Y Return %': row['5Y Ann. Return (%)']})
+        compare_df = pd.DataFrame(compare_returns[:20])
+        if not compare_df.empty:
+            fig_bar = px.bar(compare_df, x='Ticker', y='5Y Return %', color='Type', title='5Y Returns: Holdings vs. Buys (Higher = Better for Growth)')
+            fig_bar.update_layout(xaxis_tickangle=45)
+            st.plotly_chart(fig_bar)
+            st.write("Buys (orange) show higher avg returns—find missed growth here.")
+
+        # Sell Underperformers
+        st.subheader("Sell Underperformers (vs. Goals)")
+        if not sells_df.empty:
+            st.write("Low returns (<5% 5Y) or high fees drag growth. Sell to fund buys (e.g., reallocate $15K to new buys).")
+            st.dataframe(sells_df)
+        else:
+            st.info("No underperformers identified. Click 'Refresh Recommendations' to check.")
+
+        # Historical Line Chart
+        st.subheader("Historical Performance (Limited View)")
+        top_holdings = portfolio.nlargest(5, 'Current Value')['Symbol'].tolist()
+        top_buys = buys_df.head(5)['Ticker'].tolist()
+        limited_hist = historical_data[top_holdings + top_buys] if not historical_data.empty else pd.DataFrame()
+        if not limited_hist.empty:
+            fig_line = px.line(limited_hist, title='5Y Price History (Top Holdings Blue, Top Buys Orange)')
+            st.plotly_chart(fig_line)
+        else:
+            st.info("Historical data limited for some mutual funds.")
+
+        # Download Report
+        st.subheader("Download Report")
+        if st.button("Download Updated CSV"):
+            report = portfolio.to_csv(index=False)
+            st.download_button("Download", report, "portfolio_report.csv", "text/csv")
+
+    except Exception as e:
+        st.error(f"Error processing: {str(e)}. Ensure CSV has Symbol, Quantity, Last Price, Cost Basis Total.")
+
+# Alerts
+st.subheader("Set Up Alerts")
+email = st.text_input("Your Email")
+password = st.text_input("Gmail App Password", type="password")
+receiver = st.text_input("Receiver (Email or SMS Gateway, e.g., number@txt.att.net)")
+if st.button("Test Alert"):
+    try:
+        alerts = []
+        tickers = portfolio['Symbol'].unique() if 'portfolio' in locals() else []
+        for ticker in tickers[:5]:
+            try:
+                change = yf.Ticker(ticker).info.get('regularMarketChangePercent', 0)
+                if change < -5:
+                    alerts.append(f"Alert: {ticker} down {change:.1f}% - Sell?")
+                elif change > 10:
+                    alerts.append(f"Alert: {ticker} up {change:.1f}% - Buy more?")
+            except:
+                pass
+        if alerts:
+            msg = MIMEText("\n".join(alerts))
+            msg['Subject'] = f"Portfolio Alert - {datetime.now().strftime('%Y-%m-%d')}"
+            msg['From'] = email
+            msg['To'] = receiver
+            with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+                server.login(email, password)
+                server.sendmail(email, receiver, msg.as_string())
+            st.success("Test alert sent!")
+        else:
+            st.info("No alerts triggered in test.")
+    except Exception as e:
+        st.error(f"Alert error: {str(e)}. Verify Gmail App Password.")

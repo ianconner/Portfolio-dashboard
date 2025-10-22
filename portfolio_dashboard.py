@@ -7,7 +7,7 @@ from email.mime.text import MIMEText
 from datetime import datetime
 import requests
 from googlesearch import search
-import numpy as pd
+import numpy as np
 import re
 
 ALPHA_VANTAGE_KEY = "EDLDXC0QXGPRGG6U"

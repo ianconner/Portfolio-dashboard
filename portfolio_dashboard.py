@@ -40,17 +40,14 @@ def get_fresh_recs():
             ticker_data = yf.Ticker(ticker)
             info = ticker_data.info
             if 'quoteType' in info and info['quoteType'] == 'EQUITY':  # Focus on stocks
-                # Valuation relative to historical norms
                 pe = info.get('trailingPE', np.nan)
                 pb = info.get('priceToBook', np.nan)
                 forward_pe = info.get('forwardPE', np.nan)
-                # Financial health over 5 years
                 hist = ticker_data.history(period="5y")['Close']
                 five_y_return = ((hist.iloc[-1] / hist.iloc[0]) ** (1/5) - 1) * 100 if len(hist) > 1 else np.nan
                 roe = info.get('returnOnEquity', np.nan)
                 debt_to_equity = info.get('debtToEquity', np.nan)
                 beta = info.get('beta', np.nan)
-                # Moat check: High ROE, low debt
                 if (pe < 20 and pd.notna(pe)) and (forward_pe < pe and pd.notna(forward_pe)) and (pb < 3 and pd.notna(pb)) and (roe > 0.15 and pd.notna(roe)) and (debt_to_equity < 50 and pd.notna(debt_to_equity)) and (1.0 <= beta <= 1.5 and pd.notna(beta)) and (five_y_return > 8 and pd.notna(five_y_return)):
                     screened.append(ticker)
         except:
@@ -130,6 +127,11 @@ if uploaded_files:
         portfolio = pd.concat(dfs, ignore_index=True)
         if portfolio.empty:
             raise ValueError("No valid rows in CSV after filtering")
+        # Validate Last Price specifically
+        if portfolio['Last Price'].isna().any():
+            invalid_tickers = portfolio[portfolio['Last Price'].isna()]['Symbol'].tolist()
+            st.error(f"Invalid or missing Last Price in CSV for tickers: {invalid_tickers}")
+            raise ValueError(f"CSV contains invalid Last Price for tickers: {invalid_tickers}")
         st.session_state.portfolio = portfolio
         st.success("CSV uploaded and persisted! Refresh to keep using.")
     except Exception as e:
@@ -179,11 +181,18 @@ if st.session_state.portfolio is not None:
                 ticker_data = yf.Ticker(ticker)
                 info = ticker_data.info
                 csv_price = portfolio[portfolio['Symbol'] == ticker]['Last Price'].iloc[0] if ticker in portfolio['Symbol'].values else np.nan
-                price = info.get('regularMarketPrice', info.get('navPrice', info.get('previousClose', csv_price)))
-                if pd.isna(price):
-                    st.warning(f"No valid price from yfinance for {ticker}. Using CSV Last Price if available.")
+                if pd.isna(csv_price):
+                    st.warning(f"No valid CSV Last Price for {ticker}")
+                price = info.get('regularMarketPrice', info.get('navPrice', info.get('previousClose', np.nan)))
+                if pd.isna(price) and not pd.isna(csv_price):
+                    st.info(f"Using CSV Last Price for {ticker}: {csv_price:.2f}")
                     price = csv_price
+                if pd.isna(price):
+                    st.warning(f"No valid price for {ticker} from yfinance or CSV")
+                    failed_tickers.append(ticker)
+                    continue
                 current_prices[ticker] = price
+                st.info(f"Price for {ticker}: {price:.2f} (Source: {'yfinance' if price != csv_price else 'CSV'})")
                 sectors[ticker] = info.get('sector', info.get('category', 'Unknown'))
 
                 hist = ticker_data.history(period="5y")['Close']
@@ -204,16 +213,22 @@ if st.session_state.portfolio is not None:
                 }
             except Exception as e:
                 if ticker in portfolio['Symbol'].values:
-                    current_prices[ticker] = portfolio[portfolio['Symbol'] == ticker]['Last Price'].iloc[0]
-                    fundamentals[ticker] = {
-                        'pe': np.nan,
-                        'pb': np.nan,
-                        'beta': np.nan,
-                        'roe': np.nan,
-                        'debt_to_equity': np.nan,
-                        '5y_return': portfolio[portfolio['Symbol'] == ticker]['Total Gain/Loss Percent'].iloc[0] / 5 if 'Total Gain/Loss Percent' in portfolio.columns else np.nan,
-                        'expense_ratio': np.nan
-                    }
+                    csv_price = portfolio[portfolio['Symbol'] == ticker]['Last Price'].iloc[0]
+                    if not pd.isna(csv_price):
+                        current_prices[ticker] = csv_price
+                        st.info(f"Using CSV Last Price for {ticker} due to yfinance failure: {csv_price:.2f}")
+                        fundamentals[ticker] = {
+                            'pe': np.nan,
+                            'pb': np.nan,
+                            'beta': np.nan,
+                            'roe': np.nan,
+                            'debt_to_equity': np.nan,
+                            '5y_return': portfolio[portfolio['Symbol'] == ticker]['Total Gain/Loss Percent'].iloc[0] / 5 if 'Total Gain/Loss Percent' in portfolio.columns else np.nan,
+                            'expense_ratio': np.nan
+                        }
+                    else:
+                        st.warning(f"No valid CSV Last Price for {ticker}")
+                        failed_tickers.append(ticker)
                 else:
                     current_prices[ticker] = np.nan
                     fundamentals[ticker] = {
@@ -225,18 +240,18 @@ if st.session_state.portfolio is not None:
                         '5y_return': np.nan,
                         'expense_ratio': np.nan
                     }
-                failed_tickers.append(ticker)
+                    failed_tickers.append(ticker)
                 st.warning(f"yfinance failed for {ticker}: {str(e)}")
 
         if failed_tickers:
-            st.info(f"Failed tickers (using CSV prices or defaults): {', '.join(failed_tickers)}")
+            st.info(f"Failed tickers (using CSV prices or skipped): {', '.join(failed_tickers)}")
 
         # Update portfolio with robust Current Price handling
         portfolio['Current Price'] = portfolio['Symbol'].map(current_prices)
-        portfolio['Current Price'] = portfolio['Current Price'].combine_first(portfolio['Last Price'])
+        portfolio['Current Price'] = pd.to_numeric(portfolio['Current Price'], errors='coerce')
         if portfolio['Current Price'].isna().any():
             invalid_tickers = portfolio[portfolio['Current Price'].isna()]['Symbol'].tolist()
-            st.error(f"Invalid Current Price for tickers: {invalid_tickers}. Check CSV Last Price or yfinance data.")
+            st.error(f"Invalid Current Price for tickers: {invalid_tickers}. CSV Last Price values: {portfolio[portfolio['Current Price'].isna()][['Symbol', 'Last Price']].to_dict('records')}")
             raise ValueError(f"Current Price contains invalid values for tickers: {invalid_tickers}")
 
         portfolio['Current Value'] = portfolio['Quantity'] * portfolio['Current Price']

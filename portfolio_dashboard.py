@@ -6,7 +6,7 @@ import smtplib
 from email.mime.text import MIMEText
 from datetime import datetime
 import requests
-from googlesearch import search  # pip install googlesearch-python
+from googlesearch import search
 import numpy as np
 
 ALPHA_VANTAGE_KEY = "ALT5R7FXMOK16ZUO"
@@ -16,11 +16,11 @@ def get_fresh_recs():
     query = "best undervalued ETFs and mutual funds for long-term retirement 2025, medium-high risk, Warren Buffett style, no China exposure"
     results = []
     try:
-        for url in search(query, num_results=10, pause=2.0):  # Use num_results instead of stop
+        for url in search(query, num_results=10, pause=2.0):
             results.append(url)
     except Exception as e:
         st.warning(f"Web search failed: {str(e)}. Using fallback tickers.")
-        return ['VOO', 'VUG', 'SCHD']  # Minimal fallback
+        return ['VOO', 'VUG', 'SCHD']
     tickers = []
     common_tickers = ['voo', 'vug', 'schd', 'vig', 'moat', 'ijr', 'qqq', 'schg', 'sphq', 'vtiax', 'fbgrx', 'fdgrx', 'vdigx', 'prdgx', 'ihf', 'tmed', 'scha', 'spmd', 'ivv', 'vti', 'iwy', 'mgk', 'prnhx', 'vfinx']
     for url in results:
@@ -32,7 +32,7 @@ def get_fresh_recs():
                     tickers.append(ticker.upper())
         except:
             pass
-    return tickers[:10] if tickers else ['VOO', 'VUG', 'SCHD']  # Fallback if no tickers found
+    return tickers[:10] if tickers else ['VOO', 'VUG', 'SCHD']
 
 # Dynamic underperformers from portfolio
 def get_underperformers(portfolio):
@@ -43,7 +43,7 @@ def get_underperformers(portfolio):
         ]['Symbol'].tolist()
     else:
         underperformers = []
-    return underperformers if underperformers else ['FSMEX']  # Fallback
+    return underperformers if underperformers else ['FSMEX']
 
 # Placeholder images
 def get_image_url(ticker):
@@ -77,19 +77,26 @@ uploaded_files = st.file_uploader("Upload Fidelity CSVs (once; persists on refre
 if uploaded_files:
     try:
         dfs = []
+        required_columns = ['Symbol', 'Quantity', 'Last Price', 'Cost Basis Total']
         for file in uploaded_files:
             df = pd.read_csv(file, encoding='utf-8')
-            for col in ['Quantity', 'Last Price', 'Last Price Change', 'Current Value', 
-                       "Today's Gain/Loss Dollar", 'Total Gain/Loss Dollar', 'Cost Basis Total', 'Average Cost Basis']:
+            # Check for required columns
+            if not all(col in df.columns for col in required_columns):
+                missing = [col for col in required_columns if col not in df.columns]
+                raise ValueError(f"CSV missing required columns: {', '.join(missing)}")
+            # Clean numeric columns
+            for col in ['Quantity', 'Last Price', 'Cost Basis Total']:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col].replace(r'[\$,]', '', regex=True), errors='coerce')
+                    if df[col].isna().any():
+                        raise ValueError(f"Non-numeric or missing values in {col}")
             dfs.append(df)
         portfolio = pd.concat(dfs, ignore_index=True)
         portfolio = portfolio[portfolio['Symbol'].notna() & ~portfolio['Symbol'].str.contains('\*\*', na=False)]
         st.session_state.portfolio = portfolio
         st.success("CSV uploaded and persisted! Refresh to keep using.")
     except Exception as e:
-        st.error(f"Upload error: {str(e)}. Ensure CSV has Symbol, Quantity, Last Price, Cost Basis Total.")
+        st.error(f"Upload error: {str(e)}. Ensure CSV has Symbol, Quantity, Last Price, Cost Basis Total with valid numeric values.")
 
 # Use persisted portfolio
 if st.session_state.portfolio is not None:
@@ -127,10 +134,11 @@ if st.session_state.portfolio is not None:
             try:
                 url = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={ticker}&apikey={ALPHA_VANTAGE_KEY}"
                 response = requests.get(url).json()
-                target = response.get('AnalystTargetPrice', 'N/A')
+                target = response.get('AnalystTargetPrice', np.nan)
                 analyst_targets[ticker] = float(target) if target and target != 'None' else np.nan
-            except:
+            except Exception as e:
                 analyst_targets[ticker] = np.nan
+                st.warning(f"Alpha Vantage failed for {ticker}: {str(e)}")
 
         # yfinance for other data
         for ticker in all_tickers:
@@ -164,11 +172,14 @@ if st.session_state.portfolio is not None:
                         '5y_return': portfolio[portfolio['Symbol'] == ticker]['Total Gain/Loss Percent'].iloc[0] / 5 if 'Total Gain/Loss Percent' in portfolio.columns else np.nan,
                         'expense_ratio': np.nan
                     }
+                else:
+                    current_prices[ticker] = np.nan
+                    fundamentals[ticker] = {'pe': np.nan, 'pb': np.nan, 'beta': np.nan, '5y_return': np.nan, 'expense_ratio': np.nan}
                 failed_tickers.append(ticker)
-                st.warning(f"Data fetch failed for {ticker}: {str(e)}.")
+                st.warning(f"yfinance failed for {ticker}: {str(e)}")
 
         if failed_tickers:
-            st.info(f"Failed tickers (defaults used): {', '.join(failed_tickers)}")
+            st.info(f"Failed tickers (using defaults): {', '.join(failed_tickers)}")
 
         # Manual sectors fallback
         for ticker in all_tickers:
@@ -187,8 +198,14 @@ if st.session_state.portfolio is not None:
                 }
                 sectors[ticker] = manual_sectors.get(ticker, 'Unknown')
 
-        # Update portfolio
+        # Update portfolio with robust Current Price handling
         portfolio['Current Price'] = portfolio['Symbol'].map(current_prices)
+        # Ensure Current Price is float and handle NaN
+        portfolio['Current Price'] = pd.to_numeric(portfolio['Current Price'], errors='coerce').fillna(portfolio['Last Price'])
+        if portfolio['Current Price'].isna().any():
+            st.error(f"Invalid Current Price for tickers: {portfolio[portfolio['Current Price'].isna()]['Symbol'].tolist()}. Check CSV Last Price or yfinance data.")
+            raise ValueError("Current Price contains invalid values")
+        
         portfolio['Current Value'] = portfolio['Quantity'] * portfolio['Current Price']
         portfolio['Gain/Loss %'] = (portfolio['Current Value'] - portfolio['Cost Basis Total']) / portfolio['Cost Basis Total'] * 100
         portfolio['P/E Ratio'] = portfolio['Symbol'].map(lambda t: fundamentals.get(t, {}).get('pe', np.nan))
@@ -202,6 +219,10 @@ if st.session_state.portfolio is not None:
             if pd.notna(row['Analyst Target']) and pd.notna(row['Current Price']) and row['Current Price'] != 0
             else np.nan, axis=1)
         portfolio['Sector'] = portfolio['Symbol'].map(sectors)
+
+        # Ensure numeric columns are float
+        for col in ['Current Price', 'Current Value', 'Gain/Loss %', 'P/E Ratio', 'P/B Ratio', 'Beta', '5Y Ann. Return (%)', 'Expense Ratio', 'Analyst Target', 'Undervalued %']:
+            portfolio[col] = pd.to_numeric(portfolio[col], errors='coerce')
 
         # Recommendation DataFrames
         def get_rec_df(tickers_list, is_buy=True):
@@ -224,9 +245,8 @@ if st.session_state.portfolio is not None:
                     'Top Sectors': sector
                 })
             df = pd.DataFrame(rec_data)
-            # Ensure numeric columns are float
             for col in ['Current Price', 'P/E Ratio', 'P/B Ratio', 'Beta (Risk)', '5Y Ann. Return (%)', 'Expense Ratio', 'Undervalued %']:
-                df[col] = df[col].astype(float)
+                df[col] = pd.to_numeric(df[col], errors='coerce')
             return df
 
         buys_df = get_rec_df(POTENTIAL_BUYS, is_buy=True)
@@ -256,13 +276,13 @@ if st.session_state.portfolio is not None:
         # Buy Opportunities
         st.subheader("Buy Opportunities (vs. Your Holdings)")
         if not buys_df.empty:
-            st.write("These outperform underperformers with 10-20% 5Y returns, low fees (<0.5%), and undervaluation. Add to balance tech focus. Data from yfinance/analysts (Oct 21, 2025).")
+            st.write("These outperform underperformers with 10-20% 5Y returns, low fees (<0.5%), and undervaluation. Add to balance tech focus. Data from yfinance/analysts (Oct 22, 2025).")
             st.dataframe(buys_df)
 
             # Images for buys
             st.subheader("Buy Performance Visuals")
             cols = st.columns(3)
-            for i, ticker in enumerate(buys_df['Ticker'][:6]):  # Limit to 6
+            for i, ticker in enumerate(buys_df['Ticker'][:6]):
                 url = get_image_url(ticker)
                 caption = get_caption(ticker)
                 with cols[i % 3]:
@@ -312,7 +332,7 @@ if st.session_state.portfolio is not None:
             st.download_button("Download", report, "portfolio_report.csv", "text/csv")
 
     except Exception as e:
-        st.error(f"Error processing: {str(e)}. Ensure CSV has Symbol, Quantity, Last Price, Cost Basis Total.")
+        st.error(f"Error processing: {str(e)}. Ensure CSV has Symbol, Quantity, Last Price, Cost Basis Total with valid numeric values.")
 
 # Alerts
 st.subheader("Set Up Alerts")

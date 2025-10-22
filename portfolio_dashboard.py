@@ -7,21 +7,21 @@ from email.mime.text import MIMEText
 from datetime import datetime
 import requests
 from googlesearch import search
-import numpy as np
+import numpy as pd
 import re
 
-ALPHA_VANTAGE_KEY = "ALT5R7FXMOK16ZUO"
+ALPHA_VANTAGE_KEY = "EDLDXC0QXGPRGG6U"
 
-# Function to perform fresh web search and screen for hidden gems
+# Function to perform fresh web search and screen for hidden gems with value investing mindset
 def get_fresh_recs():
-    query = "best undervalued ETFs and mutual funds for long-term retirement 2025, medium-high risk, Warren Buffett style, no China exposure"
+    query = "best undervalued stocks for long-term investment 2025, medium-high risk, Benjamin Graham and Warren Buffett style, durable competitive advantage, strong financial health, no China exposure"
     results = []
     try:
-        for url in search(query, num_results=5):  # Reduced for speed
+        for url in search(query, num_results=10):
             results.append(url)
     except Exception as e:
         st.warning(f"Web search failed: {str(e)}. Using fallback tickers.")
-        return ['VOO', 'VUG', 'SCHD']  # Fallback only if search fails
+        return ['BRK.B', 'AAPL', 'KO']  # Fallback to classic Buffett stocks
     candidates = []
     for url in results:
         try:
@@ -33,23 +33,29 @@ def get_fresh_recs():
             pass
     candidates = list(set(candidates))[:50]  # Unique and limit to 50
 
-    # Screen candidates for undervalued ETFs/funds
+    # Screen candidates for value investing criteria
     screened = []
     for ticker in candidates:
         try:
-            info = yf.Ticker(ticker).info
-            if 'quoteType' in info and info['quoteType'] in ['ETF', 'FUND']:
+            ticker_data = yf.Ticker(ticker)
+            info = ticker_data.info
+            if 'quoteType' in info and info['quoteType'] == 'EQUITY':  # Focus on stocks (companies)
+                # Valuation relative to historical norms
                 pe = info.get('trailingPE', np.nan)
                 pb = info.get('priceToBook', np.nan)
-                beta = info.get('beta', np.nan)
-                expense = info.get('expenseRatio', np.nan)
-                hist = yf.Ticker(ticker).history(period="5y")['Close']
+                forward_pe = info.get('forwardPE', np.nan)
+                # Financial health over 5 years
+                hist = ticker_data.history(period="5y")['Close']
                 five_y_return = ((hist.iloc[-1] / hist.iloc[0]) ** (1/5) - 1) * 100 if len(hist) > 1 else np.nan
-                if (pe < 20 and pd.notna(pe)) and (pb < 2 and pd.notna(pb)) and (1.0 <= beta <= 1.5 and pd.notna(beta)) and (five_y_return > 10 and pd.notna(five_y_return)) and (expense < 0.5 and pd.notna(expense)):
+                roe = info.get('returnOnEquity', np.nan)
+                debt_to_equity = info.get('debtToEquity', np.nan)
+                beta = info.get('beta', np.nan)
+                # Approximate moat check: High ROE and low debt indicate competitive advantage
+                if (pe < 20 and pd.notna(pe)) and (forward_pe < pe and pd.notna(forward_pe)) and (pb < 3 and pd.notna(pb)) and (roe > 0.15 and pd.notna(roe)) and (debt_to_equity < 50 and pd.notna(debt_to_equity)) and (1.0 <= beta <= 1.5 and pd.notna(beta)) and (five_y_return > 8 and pd.notna(five_y_return)):
                     screened.append(ticker)
         except:
             pass
-    return screened[:10] if screened else ['VOO', 'VUG', 'SCHD']  # Fallback only if screening fails
+    return screened[:10] if screened else ['BRK.B', 'AAPL', 'KO']  # Fallback only if screening fails
 
 # Dynamic underperformers from portfolio
 def get_underperformers(portfolio):
@@ -96,7 +102,8 @@ if uploaded_files:
         dfs = []
         required_columns = ['Symbol', 'Quantity', 'Last Price', 'Cost Basis Total']
         for file in uploaded_files:
-            df = pd.read_csv(file, encoding='utf-8')
+            df = pd.read_csv(file, encoding='utf-8', skipfooter=5, engine='python')
+            df = df.dropna(subset=['Symbol'])
             if not all(col in df.columns for col in required_columns):
                 missing = [col for col in required_columns if col not in df.columns]
                 raise ValueError(f"CSV missing required columns: {', '.join(missing)}")
@@ -104,7 +111,7 @@ if uploaded_files:
             if df.empty:
                 raise ValueError("No valid rows after filtering invalid symbols")
             for col in ['Quantity', 'Last Price', 'Cost Basis Total']:
-                df[col] = df[col].replace(r'[\$,]', '', regex=True)
+                df[col] = df[col].astype(str).str.replace(r'[\$,]', '', regex=True).str.strip()
                 df[col] = pd.to_numeric(df[col], errors='coerce')
                 invalid_rows = df[df[col].isna()]
                 if not invalid_rows.empty:
@@ -169,7 +176,8 @@ if st.session_state.portfolio is not None:
             try:
                 ticker_data = yf.Ticker(ticker)
                 info = ticker_data.info
-                current_prices[ticker] = info.get('regularMarketPrice', portfolio[portfolio['Symbol'] == ticker]['Last Price'].iloc[0] if ticker in portfolio['Symbol'].values else np.nan)
+                csv_price = portfolio[portfolio['Symbol'] == ticker]['Last Price'].iloc[0] if ticker in portfolio['Symbol'].values else np.nan
+                current_prices[ticker] = info.get('regularMarketPrice', csv_price)
                 sectors[ticker] = info.get('sector', info.get('category', 'Unknown'))
 
                 hist = ticker_data.history(period="5y")['Close']
@@ -203,14 +211,15 @@ if st.session_state.portfolio is not None:
                 st.warning(f"yfinance failed for {ticker}: {str(e)}")
 
         if failed_tickers:
-            st.info(f"Failed tickers (using defaults): {', '.join(failed_tickers)}")
+            st.info(f"Failed tickers (using CSV prices or defaults): {', '.join(failed_tickers)}")
 
         # Update portfolio with robust Current Price handling
         portfolio['Current Price'] = portfolio['Symbol'].map(current_prices)
-        portfolio['Current Price'] = pd.to_numeric(portfolio['Current Price'], errors='coerce').fillna(portfolio['Last Price'])
+        portfolio['Current Price'] = portfolio['Current Price'].combine_first(portfolio['Last Price'])
         if portfolio['Current Price'].isna().any():
-            st.error(f"Invalid Current Price for tickers: {portfolio[portfolio['Current Price'].isna()]['Symbol'].tolist()}. Check CSV Last Price or yfinance data.")
-            raise ValueError("Current Price contains invalid values")
+            invalid_tickers = portfolio[portfolio['Current Price'].isna()]['Symbol'].tolist()
+            st.error(f"Invalid Current Price for tickers: {invalid_tickers}. Check CSV Last Price or yfinance data.")
+            raise ValueError(f"Current Price contains invalid values for tickers: {invalid_tickers}")
 
         portfolio['Current Value'] = portfolio['Quantity'] * portfolio['Current Price']
         portfolio['Gain/Loss %'] = (portfolio['Current Value'] - portfolio['Cost Basis Total']) / portfolio['Cost Basis Total'] * 100
@@ -225,38 +234,6 @@ if st.session_state.portfolio is not None:
             if pd.notna(row['Analyst Target']) and pd.notna(row['Current Price']) and row['Current Price'] != 0
             else np.nan, axis=1)
         portfolio['Sector'] = portfolio['Symbol'].map(sectors)
-
-        # Ensure numeric columns are float
-        for col in ['Current Price', 'Current Value', 'Gain/Loss %', 'P/E Ratio', 'P/B Ratio', 'Beta', '5Y Ann. Return (%)', 'Expense Ratio', 'Analyst Target', 'Undervalued %']:
-            portfolio[col] = pd.to_numeric(portfolio[col], errors='coerce')
-
-        # Recommendation DataFrames
-        def get_rec_df(tickers_list, is_buy=True):
-            rec_data = []
-            for ticker in tickers_list:
-                price = current_prices.get(ticker, np.nan)
-                data = fundamentals.get(ticker, {})
-                sector = sectors.get(ticker, 'Unknown')
-                target = analyst_targets.get(ticker, np.nan)
-                undervalued = round(((target - price) / price * 100), 2) if pd.notna(target) and pd.notna(price) and price != 0 else np.nan
-                rec_data.append({
-                    'Ticker': ticker,
-                    'Current Price': round(price, 2) if pd.notna(price) else np.nan,
-                    'P/E Ratio': round(data.get('pe', np.nan), 2) if pd.notna(data.get('pe')) else np.nan,
-                    'P/B Ratio': round(data.get('pb', np.nan), 2) if pd.notna(data.get('pb')) else np.nan,
-                    'Beta (Risk)': round(data.get('beta', np.nan), 2) if pd.notna(data.get('beta')) else np.nan,
-                    '5Y Ann. Return (%)': data.get('5y_return', np.nan),
-                    'Expense Ratio': data.get('expense_ratio', np.nan),
-                    'Undervalued %': undervalued,
-                    'Top Sectors': sector
-                })
-            df = pd.DataFrame(rec_data)
-            for col in ['Current Price', 'P/E Ratio', 'P/B Ratio', 'Beta (Risk)', '5Y Ann. Return (%)', 'Expense Ratio', 'Undervalued %']:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            return df
-
-        buys_df = get_rec_df(POTENTIAL_BUYS, is_buy=True)
-        sells_df = get_rec_df(POTENTIAL_SELLS, is_buy=False)
 
         # Portfolio Summary
         st.subheader("Your Current Portfolio Summary")

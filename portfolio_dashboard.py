@@ -39,7 +39,7 @@ def get_fresh_recs():
         try:
             ticker_data = yf.Ticker(ticker)
             info = ticker_data.info
-            if 'quoteType' in info and info['quoteType'] == 'EQUITY':  # Focus on stocks (companies)
+            if 'quoteType' in info and info['quoteType'] == 'EQUITY':  # Focus on stocks
                 # Valuation relative to historical norms
                 pe = info.get('trailingPE', np.nan)
                 pb = info.get('priceToBook', np.nan)
@@ -50,12 +50,12 @@ def get_fresh_recs():
                 roe = info.get('returnOnEquity', np.nan)
                 debt_to_equity = info.get('debtToEquity', np.nan)
                 beta = info.get('beta', np.nan)
-                # Approximate moat check: High ROE and low debt indicate competitive advantage
+                # Moat check: High ROE, low debt
                 if (pe < 20 and pd.notna(pe)) and (forward_pe < pe and pd.notna(forward_pe)) and (pb < 3 and pd.notna(pb)) and (roe > 0.15 and pd.notna(roe)) and (debt_to_equity < 50 and pd.notna(debt_to_equity)) and (1.0 <= beta <= 1.5 and pd.notna(beta)) and (five_y_return > 8 and pd.notna(five_y_return)):
                     screened.append(ticker)
         except:
             pass
-    return screened[:10] if screened else ['BRK.B', 'AAPL', 'KO']  # Fallback only if screening fails
+    return screened[:10] if screened else ['BRK.B', 'AAPL', 'KO']
 
 # Dynamic underperformers from portfolio
 def get_underperformers(portfolio):
@@ -90,10 +90,12 @@ st.write("Goal: $100K income ($70K pension + $30K withdrawal). $367K at 9% retur
 # Explanations
 st.sidebar.header("Quick Guide")
 st.sidebar.write("**P/E**: Price per $1 earnings. <20 = bargain.")
-st.sidebar.write("**P/B**: Price vs. assets. <2 = undervalued.")
+st.sidebar.write("**P/B**: Price vs. assets. <3 = undervalued.")
 st.sidebar.write("**Undervalued %**: Potential rise to target price.")
 st.sidebar.write("**Beta**: Risk vs. market (1=avg, >1=riskier).")
-st.sidebar.write("**5Y Return**: Avg yearly growth (higher = better).")
+st.sidebar.write("**5Y Return**: Avg yearly growth (>8% = strong).")
+st.sidebar.write("**ROE**: Return on equity (>15% = efficient).")
+st.sidebar.write("**Debt/Equity**: <50% = financially healthy.")
 
 # Upload CSVs (persist)
 uploaded_files = st.file_uploader("Upload Fidelity CSVs (once; persists on refresh)", type="csv", accept_multiple_files=True)
@@ -191,6 +193,8 @@ if st.session_state.portfolio is not None:
                     'pe': info.get('trailingPE', np.nan),
                     'pb': info.get('priceToBook', np.nan),
                     'beta': info.get('beta', np.nan),
+                    'roe': info.get('returnOnEquity', np.nan),
+                    'debt_to_equity': info.get('debtToEquity', np.nan),
                     '5y_return': round(five_y_return, 2) if pd.notna(five_y_return) else np.nan,
                     'expense_ratio': info.get('expenseRatio', np.nan)
                 }
@@ -201,12 +205,22 @@ if st.session_state.portfolio is not None:
                         'pe': np.nan,
                         'pb': np.nan,
                         'beta': np.nan,
+                        'roe': np.nan,
+                        'debt_to_equity': np.nan,
                         '5y_return': portfolio[portfolio['Symbol'] == ticker]['Total Gain/Loss Percent'].iloc[0] / 5 if 'Total Gain/Loss Percent' in portfolio.columns else np.nan,
                         'expense_ratio': np.nan
                     }
                 else:
                     current_prices[ticker] = np.nan
-                    fundamentals[ticker] = {'pe': np.nan, 'pb': np.nan, 'beta': np.nan, '5y_return': np.nan, 'expense_ratio': np.nan}
+                    fundamentals[ticker] = {
+                        'pe': np.nan,
+                        'pb': np.nan,
+                        'beta': np.nan,
+                        'roe': np.nan,
+                        'debt_to_equity': np.nan,
+                        '5y_return': np.nan,
+                        'expense_ratio': np.nan
+                    }
                 failed_tickers.append(ticker)
                 st.warning(f"yfinance failed for {ticker}: {str(e)}")
 
@@ -226,6 +240,8 @@ if st.session_state.portfolio is not None:
         portfolio['P/E Ratio'] = portfolio['Symbol'].map(lambda t: fundamentals.get(t, {}).get('pe', np.nan))
         portfolio['P/B Ratio'] = portfolio['Symbol'].map(lambda t: fundamentals.get(t, {}).get('pb', np.nan))
         portfolio['Beta'] = portfolio['Symbol'].map(lambda t: fundamentals.get(t, {}).get('beta', np.nan))
+        portfolio['ROE (%)'] = portfolio['Symbol'].map(lambda t: fundamentals.get(t, {}).get('roe', np.nan) * 100 if pd.notna(fundamentals.get(t, {}).get('roe')) else np.nan)
+        portfolio['Debt/Equity (%)'] = portfolio['Symbol'].map(lambda t: fundamentals.get(t, {}).get('debt_to_equity', np.nan))
         portfolio['5Y Ann. Return (%)'] = portfolio['Symbol'].map(lambda t: fundamentals.get(t, {}).get('5y_return', np.nan))
         portfolio['Expense Ratio'] = portfolio['Symbol'].map(lambda t: fundamentals.get(t, {}).get('expense_ratio', np.nan))
         portfolio['Analyst Target'] = portfolio['Symbol'].map(lambda t: analyst_targets.get(t, np.nan))
@@ -235,9 +251,43 @@ if st.session_state.portfolio is not None:
             else np.nan, axis=1)
         portfolio['Sector'] = portfolio['Symbol'].map(sectors)
 
+        # Ensure numeric columns are float
+        for col in ['Current Price', 'Current Value', 'Gain/Loss %', 'P/E Ratio', 'P/B Ratio', 'Beta', 'ROE (%)', 'Debt/Equity (%)', '5Y Ann. Return (%)', 'Expense Ratio', 'Analyst Target', 'Undervalued %']:
+            portfolio[col] = pd.to_numeric(portfolio[col], errors='coerce')
+
+        # Recommendation DataFrames
+        def get_rec_df(tickers_list, is_buy=True):
+            rec_data = []
+            for ticker in tickers_list:
+                price = current_prices.get(ticker, np.nan)
+                data = fundamentals.get(ticker, {})
+                sector = sectors.get(ticker, 'Unknown')
+                target = analyst_targets.get(ticker, np.nan)
+                undervalued = round(((target - price) / price * 100), 2) if pd.notna(target) and pd.notna(price) and price != 0 else np.nan
+                rec_data.append({
+                    'Ticker': ticker,
+                    'Current Price': round(price, 2) if pd.notna(price) else np.nan,
+                    'P/E Ratio': round(data.get('pe', np.nan), 2) if pd.notna(data.get('pe')) else np.nan,
+                    'P/B Ratio': round(data.get('pb', np.nan), 2) if pd.notna(data.get('pb')) else np.nan,
+                    'Beta (Risk)': round(data.get('beta', np.nan), 2) if pd.notna(data.get('beta')) else np.nan,
+                    'ROE (%)': round(data.get('roe', np.nan) * 100, 2) if pd.notna(data.get('roe')) else np.nan,
+                    'Debt/Equity (%)': round(data.get('debt_to_equity', np.nan), 2) if pd.notna(data.get('debt_to_equity')) else np.nan,
+                    '5Y Ann. Return (%)': data.get('5y_return', np.nan),
+                    'Undervalued %': undervalued,
+                    'Top Sectors': sector
+                })
+            df = pd.DataFrame(rec_data)
+            for col in ['Current Price', 'P/E Ratio', 'P/B Ratio', 'Beta (Risk)', 'ROE (%)', 'Debt/Equity (%)', '5Y Ann. Return (%)', 'Undervalued %']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            return df
+
+        # Create recommendation DataFrames before display sections
+        buys_df = get_rec_df(POTENTIAL_BUYS, is_buy=True)
+        sells_df = get_rec_df(POTENTIAL_SELLS, is_buy=False)
+
         # Portfolio Summary
         st.subheader("Your Current Portfolio Summary")
-        st.dataframe(portfolio[['Symbol', 'Current Value', 'Gain/Loss %', 'P/E Ratio', 'P/B Ratio', 'Beta', '5Y Ann. Return (%)', 'Undervalued %', 'Sector']])
+        st.dataframe(portfolio[['Symbol', 'Current Value', 'Gain/Loss %', 'P/E Ratio', 'P/B Ratio', 'Beta', 'ROE (%)', 'Debt/Equity (%)', '5Y Ann. Return (%)', 'Undervalued %', 'Sector']])
 
         # Goal Analysis
         st.subheader("Analysis vs. 2042 Goal ($100K Income)")
@@ -259,7 +309,7 @@ if st.session_state.portfolio is not None:
         # Buy Opportunities
         st.subheader("Buy Opportunities (vs. Your Holdings)")
         if not buys_df.empty:
-            st.write("These outperform underperformers with 10-20% 5Y returns, low fees (<0.5%), and undervaluation. Add to balance tech focus. Data from yfinance/analysts (Oct 22, 2025).")
+            st.write("These stocks align with Buffett/Graham principles: strong moats (high ROE, low debt), undervaluation (P/E < 20, P/B < 3), and solid 5Y returns (>8%). Add to balance tech focus. Data from yfinance/analysts (Oct 22, 2025).")
             st.dataframe(buys_df)
 
             # Images for buys

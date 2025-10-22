@@ -8,31 +8,48 @@ from datetime import datetime
 import requests
 from googlesearch import search
 import numpy as np
+import re
 
 ALPHA_VANTAGE_KEY = "ALT5R7FXMOK16ZUO"
 
-# Function to perform fresh web search for buy recommendations
+# Function to perform fresh web search and screen for hidden gems
 def get_fresh_recs():
     query = "best undervalued ETFs and mutual funds for long-term retirement 2025, medium-high risk, Warren Buffett style, no China exposure"
     results = []
     try:
-        for url in search(query, num_results=10):  # Removed pause parameter
+        for url in search(query, num_results=5):  # Reduced for speed
             results.append(url)
     except Exception as e:
-        st.warning(f"Web search failed: {str(e)}. Using fallback tickers (VOO, VUG, SCHD).")
-        return ['VOO', 'VUG', 'SCHD']
-    tickers = []
-    common_tickers = ['voo', 'vug', 'schd', 'vig', 'moat', 'ijr', 'qqq', 'schg', 'sphq', 'vtiax', 'fbgrx', 'fdgrx', 'vdigx', 'prdgx', 'ihf', 'tmed', 'scha', 'spmd', 'ivv', 'vti', 'iwy', 'mgk', 'prnhx', 'vfinx']
+        st.warning(f"Web search failed: {str(e)}. Using fallback tickers.")
+        return ['VOO', 'VUG', 'SCHD']  # Fallback only if search fails
+    candidates = []
     for url in results:
         try:
             response = requests.get(url, timeout=5)
-            text = response.text.lower()
-            for ticker in common_tickers:
-                if ticker in text and ticker.upper() not in tickers:
-                    tickers.append(ticker.upper())
+            text = response.text.upper()
+            potential = re.findall(r'\b[A-Z]{3,5}\b', text)
+            candidates.extend(potential)
         except:
             pass
-    return tickers[:10] if tickers else ['VOO', 'VUG', 'SCHD']
+    candidates = list(set(candidates))[:50]  # Unique and limit to 50
+
+    # Screen candidates for undervalued ETFs/funds
+    screened = []
+    for ticker in candidates:
+        try:
+            info = yf.Ticker(ticker).info
+            if 'quoteType' in info and info['quoteType'] in ['ETF', 'FUND']:
+                pe = info.get('trailingPE', np.nan)
+                pb = info.get('priceToBook', np.nan)
+                beta = info.get('beta', np.nan)
+                expense = info.get('expenseRatio', np.nan)
+                hist = yf.Ticker(ticker).history(period="5y")['Close']
+                five_y_return = ((hist.iloc[-1] / hist.iloc[0]) ** (1/5) - 1) * 100 if len(hist) > 1 else np.nan
+                if (pe < 20 and pd.notna(pe)) and (pb < 2 and pd.notna(pb)) and (1.0 <= beta <= 1.5 and pd.notna(beta)) and (five_y_return > 10 and pd.notna(five_y_return)) and (expense < 0.5 and pd.notna(expense)):
+                    screened.append(ticker)
+        except:
+            pass
+    return screened[:10] if screened else ['VOO', 'VUG', 'SCHD']  # Fallback only if screening fails
 
 # Dynamic underperformers from portfolio
 def get_underperformers(portfolio):
@@ -43,7 +60,7 @@ def get_underperformers(portfolio):
         ]['Symbol'].tolist()
     else:
         underperformers = []
-    return underperformers if underperformers else ['FSMEX']
+    return underperformers
 
 # Placeholder images
 def get_image_url(ticker):
@@ -80,30 +97,24 @@ if uploaded_files:
         required_columns = ['Symbol', 'Quantity', 'Last Price', 'Cost Basis Total']
         for file in uploaded_files:
             df = pd.read_csv(file, encoding='utf-8')
-            # Check for required columns
             if not all(col in df.columns for col in required_columns):
                 missing = [col for col in required_columns if col not in df.columns]
                 raise ValueError(f"CSV missing required columns: {', '.join(missing)}")
-            # Filter out invalid symbols early (e.g., ** or NaN)
             df = df[df['Symbol'].notna() & ~df['Symbol'].str.contains('\*\*', na=False)]
             if df.empty:
-                raise ValueError("No valid rows after filtering invalid symbols (e.g., containing '**' or NaN)")
-            # Clean and validate numeric columns
+                raise ValueError("No valid rows after filtering invalid symbols")
             for col in ['Quantity', 'Last Price', 'Cost Basis Total']:
-                if col in df.columns:
-                    df[col] = df[col].replace(r'[\$,]', '', regex=True)  # Remove $ and commas
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                    # Log invalid rows
-                    invalid_rows = df[df[col].isna()]
-                    if not invalid_rows.empty:
-                        error_msg = f"Non-numeric or missing values in {col}:\n"
-                        for idx, row in invalid_rows.iterrows():
-                            error_msg += f"Row {idx + 2}: Symbol={row['Symbol']}, {col}={row[col]}\n"
-                        st.warning(error_msg)
-                        # Filter out invalid rows
-                        df = df[df[col].notna()]
-                        if df.empty:
-                            raise ValueError(f"All rows in {col} are invalid after filtering")
+                df[col] = df[col].replace(r'[\$,]', '', regex=True)
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+                invalid_rows = df[df[col].isna()]
+                if not invalid_rows.empty:
+                    error_msg = f"Non-numeric or missing values in {col}:\n"
+                    for idx, row in invalid_rows.iterrows():
+                        error_msg += f"Row {idx + 2}: Symbol={row['Symbol']}, {col}={row[col]}\n"
+                    st.warning(error_msg)
+                    df = df[df[col].notna()]
+                    if df.empty:
+                        raise ValueError(f"All rows in {col} are invalid")
             dfs.append(df)
         if not dfs:
             raise ValueError("No valid data after cleaning")
@@ -113,7 +124,7 @@ if uploaded_files:
         st.session_state.portfolio = portfolio
         st.success("CSV uploaded and persisted! Refresh to keep using.")
     except Exception as e:
-        st.error(f"Upload error: {str(e)}. Ensure CSV has Symbol, Quantity, Last Price, Cost Basis Total with valid numeric values. Remove cash positions (e.g., FCASH, SPAXX, CORE) or fix NaN symbols.")
+        st.error(f"Upload error: {str(e)}. Ensure CSV has Symbol, Quantity, Last Price, Cost Basis Total with valid numeric values. Remove cash positions (e.g., FCASH, SPAXX, CORE).")
 
 # Use persisted portfolio
 if st.session_state.portfolio is not None:
@@ -123,18 +134,14 @@ if st.session_state.portfolio is not None:
     try:
         # Refresh Recommendations Button
         if st.button("Refresh Recommendations (Internet Search - May Take 30-60s)"):
-            with st.spinner("Searching internet for fresh recommendations..."):
+            with st.spinner("Searching internet for fresh recommendations and screening for hidden gems..."):
                 st.session_state.potential_buys = get_fresh_recs()
                 st.session_state.potential_sells = get_underperformers(portfolio)
             st.success("Recommendations refreshed from web search!")
 
         # Use current recs or prompt for refresh
-        if not st.session_state.potential_buys:
-            st.warning("No buy recommendations yet. Click 'Refresh Recommendations' to search.")
-            POTENTIAL_BUYS = []
-        else:
-            POTENTIAL_BUYS = st.session_state.potential_buys
-        POTENTIAL_SELLS = st.session_state.potential_sells
+        POTENTIAL_BUYS = st.session_state.potential_buys if st.session_state.potential_buys else []
+        POTENTIAL_SELLS = st.session_state.potential_sells if st.session_state.potential_sells else []
 
         # Data fetching
         all_tickers = list(portfolio['Symbol'].unique()) + POTENTIAL_BUYS + POTENTIAL_SELLS
@@ -176,7 +183,7 @@ if st.session_state.portfolio is not None:
                     'pe': info.get('trailingPE', np.nan),
                     'pb': info.get('priceToBook', np.nan),
                     'beta': info.get('beta', np.nan),
-                    '5y_return': round(five_y_return, 2) if isinstance(five_y_return, float) else np.nan,
+                    '5y_return': round(five_y_return, 2) if pd.notna(five_y_return) else np.nan,
                     'expense_ratio': info.get('expenseRatio', np.nan)
                 }
             except Exception as e:
@@ -197,23 +204,6 @@ if st.session_state.portfolio is not None:
 
         if failed_tickers:
             st.info(f"Failed tickers (using defaults): {', '.join(failed_tickers)}")
-
-        # Manual sectors fallback
-        for ticker in all_tickers:
-            if sectors.get(ticker, 'Unknown') == 'Unknown':
-                manual_sectors = {
-                    'FCNTX': 'Large Growth', 'FGRTX': 'Large Blend', 'FSELX': 'Technology', 
-                    'FBGRX': 'Large Growth', 'FSDAX': 'Industrials', 'FXAIX': 'Large Blend',
-                    'FDLSX': 'Consumer Cyclical', 'FIDSX': 'Financial', 'FNARX': 'Energy',
-                    'FSHOX': 'Consumer Cyclical', 'FSLBX': 'Financial', 'FSPTX': 'Technology',
-                    'FPURX': 'Allocation', 'FSMEX': 'Health', 'JAGTX': 'Technology',
-                    'PRWAX': 'All-Cap Growth', 'FDGRX': 'Large Growth', 'VTIAX': 'International Blend',
-                    'VDIGX': 'Dividend Growth', 'PRDGX': 'Dividend Growth', 'PRNHX': 'Mid-Cap Growth',
-                    'VFINX': 'Large Blend', 'TMED': 'Health', 'IHF': 'Health', 'SCHA': 'Small Blend',
-                    'SPMD': 'Mid-Cap Blend', 'IVV': 'Large Blend', 'VTI': 'Large Blend', 'IWY': 'Large Growth',
-                    'MGK': 'Large Growth'
-                }
-                sectors[ticker] = manual_sectors.get(ticker, 'Unknown')
 
         # Update portfolio with robust Current Price handling
         portfolio['Current Price'] = portfolio['Symbol'].map(current_prices)
@@ -348,7 +338,7 @@ if st.session_state.portfolio is not None:
             st.download_button("Download", report, "portfolio_report.csv", "text/csv")
 
     except Exception as e:
-        st.error(f"Error processing: {str(e)}. Ensure CSV has Symbol, Quantity, Last Price, Cost Basis Total with valid numeric values. Remove cash positions (e.g., FCASH, SPAXX, CORE) or fix NaN symbols.")
+        st.error(f"Error processing: {str(e)}. Ensure CSV has Symbol, Quantity, Last Price, Cost Basis Total with valid numeric values. Remove cash positions (e.g., FCASH, SPAXX, CORE).")
 
 # Alerts
 st.subheader("Set Up Alerts")
@@ -370,7 +360,7 @@ if st.button("Test Alert"):
                 pass
         if alerts:
             msg = MIMEText("\n".join(alerts))
-            msg['Subject'] = f"Portfolio Alert - {datetime.now().strftime('%Y-%-m-%d')}"
+            msg['Subject'] = f"Portfolio Alert - {datetime.now().strftime('%Y-%m-%d')}"
             msg['From'] = email
             msg['To'] = receiver
             with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:

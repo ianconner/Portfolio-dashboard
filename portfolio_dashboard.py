@@ -84,15 +84,29 @@ if uploaded_files:
             if not all(col in df.columns for col in required_columns):
                 missing = [col for col in required_columns if col not in df.columns]
                 raise ValueError(f"CSV missing required columns: {', '.join(missing)}")
-            # Clean numeric columns
+            # Clean and validate numeric columns
             for col in ['Quantity', 'Last Price', 'Cost Basis Total']:
                 if col in df.columns:
-                    df[col] = pd.to_numeric(df[col].replace(r'[\$,]', '', regex=True), errors='coerce')
-                    if df[col].isna().any():
-                        raise ValueError(f"Non-numeric or missing values in {col}")
+                    df[col] = df[col].replace(r'[\$,]', '', regex=True)  # Remove $ and commas
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                    # Check for NaN or non-numeric values
+                    invalid_rows = df[df[col].isna()]
+                    if not invalid_rows.empty:
+                        error_msg = f"Non-numeric or missing values in {col}:\n"
+                        for idx, row in invalid_rows.iterrows():
+                            error_msg += f"Row {idx + 2}: Symbol={row['Symbol']}, {col}={row[col]}\n"
+                        st.error(error_msg)
+                        # Filter out invalid rows
+                        df = df[df[col].notna()]
+                        if df.empty:
+                            raise ValueError(f"All rows in {col} are invalid")
             dfs.append(df)
+        if not dfs:
+            raise ValueError("No valid data after cleaning")
         portfolio = pd.concat(dfs, ignore_index=True)
         portfolio = portfolio[portfolio['Symbol'].notna() & ~portfolio['Symbol'].str.contains('\*\*', na=False)]
+        if portfolio.empty:
+            raise ValueError("No valid rows in CSV after filtering")
         st.session_state.portfolio = portfolio
         st.success("CSV uploaded and persisted! Refresh to keep using.")
     except Exception as e:
@@ -200,12 +214,11 @@ if st.session_state.portfolio is not None:
 
         # Update portfolio with robust Current Price handling
         portfolio['Current Price'] = portfolio['Symbol'].map(current_prices)
-        # Ensure Current Price is float and handle NaN
         portfolio['Current Price'] = pd.to_numeric(portfolio['Current Price'], errors='coerce').fillna(portfolio['Last Price'])
         if portfolio['Current Price'].isna().any():
             st.error(f"Invalid Current Price for tickers: {portfolio[portfolio['Current Price'].isna()]['Symbol'].tolist()}. Check CSV Last Price or yfinance data.")
             raise ValueError("Current Price contains invalid values")
-        
+
         portfolio['Current Value'] = portfolio['Quantity'] * portfolio['Current Price']
         portfolio['Gain/Loss %'] = (portfolio['Current Value'] - portfolio['Cost Basis Total']) / portfolio['Cost Basis Total'] * 100
         portfolio['P/E Ratio'] = portfolio['Symbol'].map(lambda t: fundamentals.get(t, {}).get('pe', np.nan))
